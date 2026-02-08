@@ -1,0 +1,139 @@
+name: build-multi-target
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  pull_request:
+
+jobs:
+  meta:
+    runs-on: ubuntu-latest
+    outputs:
+      pkg_name: ${{ steps.read.outputs.pkg_name }}
+      pkg_version: ${{ steps.read.outputs.pkg_version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read package metadata from Cargo.toml
+        id: read
+        shell: bash
+        run: |
+          set -euo pipefail
+          pkg_name="$(grep -m1 '^name\s*=' Cargo.toml | sed -E 's/name\s*=\s*"([^"]+)"/\1/')"
+          pkg_version="$(grep -m1 '^version\s*=' Cargo.toml | sed -E 's/version\s*=\s*"([^"]+)"/\1/')"
+          if [[ -z "${pkg_name}" || -z "${pkg_version}" ]]; then
+            echo "Failed to parse package name/version from Cargo.toml" >&2
+            exit 1
+          fi
+          echo "pkg_name=${pkg_name}" >> "$GITHUB_OUTPUT"
+          echo "pkg_version=${pkg_version}" >> "$GITHUB_OUTPUT"
+
+  build:
+    runs-on: ${{ matrix.os }}
+    needs: meta
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            target_label: linux64
+            binary_ext: ""
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            target_label: windows64
+            binary_ext: ".exe"
+          - os: ubuntu-latest
+            target: aarch64-linux-android
+            target_label: aarch64-linux-android
+            binary_ext: ""
+            android: true
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Setup Android NDK
+        if: ${{ matrix.android == true }}
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r26d
+
+      - name: Configure Android linker
+        if: ${{ matrix.android == true }}
+        shell: bash
+        run: |
+          echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=${ANDROID_NDK_ROOT}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android21-clang" >> "$GITHUB_ENV"
+
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package artifact (Linux/Android)
+        if: ${{ matrix.os != 'windows-latest' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          pkg="${{ needs.meta.outputs.pkg_name }}"
+          ver="${{ needs.meta.outputs.pkg_version }}"
+          label="${{ matrix.target_label }}"
+          bin="target/${{ matrix.target }}/release/${pkg}"
+          out="${pkg}-v${ver}-${label}.tar.gz"
+          if [[ ! -f "${bin}" ]]; then
+            echo "Binary not found: ${bin}" >&2
+            exit 1
+          fi
+          mkdir -p dist
+          tar -czf "dist/${out}" -C "target/${{ matrix.target }}/release" "${pkg}"
+
+      - name: Package artifact (Windows)
+        if: ${{ matrix.os == 'windows-latest' }}
+        shell: pwsh
+        run: |
+          $pkg = "${{ needs.meta.outputs.pkg_name }}"
+          $ver = "${{ needs.meta.outputs.pkg_version }}"
+          $label = "${{ matrix.target_label }}"
+          $bin = "target/${{ matrix.target }}/release/$pkg${{ matrix.binary_ext }}"
+          $out = "$pkg-v$ver-$label.zip"
+          if (-not (Test-Path $bin)) {
+            throw "Binary not found: $bin"
+          }
+          New-Item -ItemType Directory -Path dist -Force | Out-Null
+          Compress-Archive -Path $bin -DestinationPath "dist/$out" -Force
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ needs.meta.outputs.pkg_name }}-v${{ needs.meta.outputs.pkg_version }}-${{ matrix.target_label }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    runs-on: ubuntu-latest
+    needs:
+      - meta
+      - build
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ${{ needs.meta.outputs.pkg_name }}-v${{ needs.meta.outputs.pkg_version }}-*
+          path: dist
+          merge-multiple: true
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ needs.meta.outputs.pkg_name }} v${{ needs.meta.outputs.pkg_version }}
+          files: dist/*
